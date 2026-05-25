@@ -32,8 +32,16 @@ jobs:
       - name: 'Resolve Project Dependencies Using Dotnet'
         shell: pwsh
         run: |
-          pushd './${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}'
-          dotnet build --configuration Release --output ./output
+          pushd '${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}'
+          # Try to find a solution first, then a project file
+          $proj = Get-ChildItem -Recurse -File -Filter *.sln -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $proj) { $proj = Get-ChildItem -Recurse -File -Filter *.csproj -ErrorAction SilentlyContinue | Select-Object -First 1 }
+          if (-not $proj) {
+            Write-Error "No .sln or .csproj found under $PWD. Set AZURE_FUNCTIONAPP_PACKAGE_PATH to your project folder."
+            exit 1
+          }
+          Write-Host "Found project: $($proj.FullName)"
+          dotnet build $proj.FullName --configuration Release --output ./output
           popd
       
       - name: Login to Azure
