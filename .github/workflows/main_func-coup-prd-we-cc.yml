@@ -36,10 +36,26 @@ jobs:
           # Try to find a solution first, then a project file
           $proj = Get-ChildItem -Recurse -File -Filter *.sln -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $proj) { $proj = Get-ChildItem -Recurse -File -Filter *.csproj -ErrorAction SilentlyContinue | Select-Object -First 1 }
+
+          # If not found, attempt to extract a zip (if present) and search inside it
           if (-not $proj) {
-            Write-Error "No .sln or .csproj found under $PWD. Set AZURE_FUNCTIONAPP_PACKAGE_PATH to your project folder."
+            $zip = Get-ChildItem -File -Filter *.zip -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($zip) {
+              Write-Host "Found zip archive: $($zip.FullName). Extracting to ./extracted"
+              $extractDir = Join-Path -Path $PWD -ChildPath 'extracted'
+              if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+              Expand-Archive -Path $zip.FullName -DestinationPath $extractDir -Force
+              # search for project/solution inside extracted folder
+              $proj = Get-ChildItem -Path $extractDir -Recurse -File -Filter *.sln -ErrorAction SilentlyContinue | Select-Object -First 1
+              if (-not $proj) { $proj = Get-ChildItem -Path $extractDir -Recurse -File -Filter *.csproj -ErrorAction SilentlyContinue | Select-Object -First 1 }
+            }
+          }
+
+          if (-not $proj) {
+            Write-Error "No .sln or .csproj found under $PWD and no zip with a project was found. Set AZURE_FUNCTIONAPP_PACKAGE_PATH to your project folder."
             exit 1
           }
+
           Write-Host "Found project: $($proj.FullName)"
           dotnet build $proj.FullName --configuration Release --output ./output
           popd
