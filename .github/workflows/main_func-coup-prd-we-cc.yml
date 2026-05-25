@@ -75,7 +75,11 @@ jobs:
           }
 
           Compress-Archive -Path ./output/* -DestinationPath ./functionapp.zip
-          Write-Host "Created deployment package: $((Resolve-Path ./functionapp.zip).Path)"
+          $zipPath = (Resolve-Path ./functionapp.zip).Path
+          $stableZipPath = Join-Path -Path $env:GITHUB_WORKSPACE -ChildPath 'functionapp.zip'
+          if (Test-Path $stableZipPath) { Remove-Item -Force $stableZipPath }
+          Copy-Item -Path $zipPath -Destination $stableZipPath
+          Write-Host "Created deployment package: $stableZipPath"
           popd
       
       - name: Login to Azure
@@ -85,6 +89,23 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_9D38AF90FFED48AD9829915BB78A14E6 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_71A0F113FAF048E08C8A3813214EEB26 }}
 
+      - name: 'Resolve Function App Resource Group'
+        shell: pwsh
+        run: |
+          $rg = az functionapp show --name 'func-coup-prd-we-cc' --query resourceGroup -o tsv
+          if (-not $rg) {
+            Write-Error "Could not resolve resource group for function app func-coup-prd-we-cc."
+            exit 1
+          }
+          Write-Host "Resolved resource group: $rg"
+          "FUNCTIONAPP_RESOURCE_GROUP=$rg" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 'Prepare Function App for Zip Deploy'
+        shell: pwsh
+        run: |
+          az functionapp config appsettings set --name 'func-coup-prd-we-cc' --resource-group "$env:FUNCTIONAPP_RESOURCE_GROUP" --settings WEBSITE_RUN_FROM_PACKAGE=1 SCM_DO_BUILD_DURING_DEPLOYMENT=false ENABLE_ORYX_BUILD=false
+          az functionapp restart --name 'func-coup-prd-we-cc' --resource-group "$env:FUNCTIONAPP_RESOURCE_GROUP"
+
       - name: 'Run Azure Functions Action (Attempt 1)'
         uses: Azure/functions-action@v1
         id: fa_attempt_1
@@ -92,7 +113,7 @@ jobs:
         with:
           app-name: 'func-coup-prd-we-cc'
           slot-name: 'Production'
-          package: '${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}/functionapp.zip'
+          package: '${{ github.workspace }}/functionapp.zip'
 
       - name: 'Run Azure Functions Action (Attempt 2)'
         if: steps.fa_attempt_1.outcome == 'failure'
@@ -101,12 +122,69 @@ jobs:
         with:
           app-name: 'func-coup-prd-we-cc'
           slot-name: 'Production'
-          package: '${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}/functionapp.zip'
+          package: '${{ github.workspace }}/functionapp.zip'
 
-      - name: 'Fail if Deployment Failed Twice'
+      - name: 'Fallback Deploy via Azure CLI ZipDeploy'
         if: steps.fa_attempt_1.outcome == 'failure' && steps.fa_attempt_2.outcome == 'failure'
+        id: cli_zipdeploy
+        continue-on-error: true
         shell: pwsh
         run: |
-          Write-Error "Deployment failed in both attempts. Review Kudu/ZipDeploy logs for details."
+          $stableZipPath = Join-Path -Path $env:GITHUB_WORKSPACE -ChildPath 'functionapp.zip'
+          az functionapp deployment source config-zip --name 'func-coup-prd-we-cc' --resource-group "$env:FUNCTIONAPP_RESOURCE_GROUP" --src $stableZipPath
+
+      - name: 'Collect Kudu Diagnostics After Failed Deploy'
+        if: steps.fa_attempt_1.outcome == 'failure' && steps.fa_attempt_2.outcome == 'failure' && steps.cli_zipdeploy.outcome == 'failure'
+        shell: pwsh
+        run: |
+          $appName = 'func-coup-prd-we-cc'
+          $rg = "$env:FUNCTIONAPP_RESOURCE_GROUP"
+
+          Write-Host "--- Function App Runtime Summary ---"
+          az functionapp show --name $appName --resource-group $rg --query "{name:name,state:state,kind:kind,enabledHostNames:enabledHostNames,linuxFxVersion:siteConfig.linuxFxVersion,netFrameworkVersion:siteConfig.netFrameworkVersion}" -o json
+
+          Write-Host "--- Required App Settings Presence ---"
+          $settings = az functionapp config appsettings list --name $appName --resource-group $rg | ConvertFrom-Json
+          foreach ($key in @('AzureWebJobsStorage','FUNCTIONS_WORKER_RUNTIME','WEBSITE_RUN_FROM_PACKAGE')) {
+            $exists = $null -ne ($settings | Where-Object { $_.name -eq $key } | Select-Object -First 1)
+            $state = if ($exists) { 'present' } else { 'MISSING' }
+            Write-Host "$key: $state"
+          }
+
+          Write-Host "--- Kudu Latest Deployment Logs ---"
+          $scmHost = az functionapp show --name $appName --resource-group $rg --query "enabledHostNames[?contains(@, 'scm')]|[0]" -o tsv
+          if (-not $scmHost) {
+            Write-Host "SCM host not found; skipping Kudu log retrieval."
+            exit 0
+          }
+
+          $profilesXml = az functionapp deployment list-publishing-profiles --name $appName --resource-group $rg --xml
+          [xml]$profiles = $profilesXml
+          $publishProfile = $profiles.publishData.publishProfile | Where-Object { $_.publishMethod -eq 'MSDeploy' } | Select-Object -First 1
+          if (-not $publishProfile) {
+            Write-Host "Publish profile not available; skipping Kudu log retrieval."
+            exit 0
+          }
+
+          $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($publishProfile.userName):$($publishProfile.userPWD)"))
+          $headers = @{ Authorization = "Basic $basic" }
+          $base = "https://$scmHost"
+          $deployments = Invoke-RestMethod -Method Get -Uri "$base/api/deployments" -Headers $headers
+          $latest = $deployments | Select-Object -First 1
+          if (-not $latest) {
+            Write-Host "No Kudu deployment records found."
+            exit 0
+          }
+
+          Write-Host "Latest deployment id: $($latest.id) status: $($latest.status)"
+          $logs = Invoke-RestMethod -Method Get -Uri "$base/api/deployments/$($latest.id)/log" -Headers $headers
+          $logs | Select-Object -First 100 | ForEach-Object {
+            Write-Host "[$($_.type)] $($_.message)"
+          }
+
+      - name: 'Fail if Deployment Failed All Attempts'
+        if: steps.fa_attempt_1.outcome == 'failure' && steps.fa_attempt_2.outcome == 'failure' && steps.cli_zipdeploy.outcome == 'failure'
+        shell: pwsh
+        run: |
+          Write-Error "Deployment failed in both functions-action attempts and Azure CLI fallback. Review diagnostics above."
           exit 1
-          
