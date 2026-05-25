@@ -57,7 +57,25 @@ jobs:
           }
 
           Write-Host "Found project: $($proj.FullName)"
-          dotnet build $proj.FullName --configuration Release --output ./output
+          # Publish a clean deployable folder and zip its contents for Kudu ZipDeploy
+          if (Test-Path ./output) { Remove-Item -Recurse -Force ./output }
+          if (Test-Path ./functionapp.zip) { Remove-Item -Force ./functionapp.zip }
+
+          dotnet publish $proj.FullName --configuration Release --output ./output
+
+          if (-not (Test-Path ./output/host.json)) {
+            Write-Error "Publish output is missing host.json. Ensure host.json is included in the function project."
+            exit 1
+          }
+
+          $dll = Get-ChildItem -Path ./output -File -Filter *.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) {
+            Write-Error "Publish output does not contain any .dll files."
+            exit 1
+          }
+
+          Compress-Archive -Path ./output/* -DestinationPath ./functionapp.zip
+          Write-Host "Created deployment package: $((Resolve-Path ./functionapp.zip).Path)"
           popd
       
       - name: Login to Azure
@@ -67,11 +85,28 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_9D38AF90FFED48AD9829915BB78A14E6 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_71A0F113FAF048E08C8A3813214EEB26 }}
 
-      - name: 'Run Azure Functions Action'
+      - name: 'Run Azure Functions Action (Attempt 1)'
         uses: Azure/functions-action@v1
-        id: fa
+        id: fa_attempt_1
+        continue-on-error: true
         with:
           app-name: 'func-coup-prd-we-cc'
           slot-name: 'Production'
-          package: '${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}/output'
+          package: '${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}/functionapp.zip'
+
+      - name: 'Run Azure Functions Action (Attempt 2)'
+        if: steps.fa_attempt_1.outcome == 'failure'
+        uses: Azure/functions-action@v1
+        id: fa_attempt_2
+        with:
+          app-name: 'func-coup-prd-we-cc'
+          slot-name: 'Production'
+          package: '${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}/functionapp.zip'
+
+      - name: 'Fail if Deployment Failed Twice'
+        if: steps.fa_attempt_1.outcome == 'failure' && steps.fa_attempt_2.outcome == 'failure'
+        shell: pwsh
+        run: |
+          Write-Error "Deployment failed in both attempts. Review Kudu/ZipDeploy logs for details."
+          exit 1
           
