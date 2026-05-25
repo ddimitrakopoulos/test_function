@@ -59,7 +59,8 @@ jobs:
           Write-Host "Found project: $($proj.FullName)"
           # Publish a clean deployable folder and zip its contents for Kudu ZipDeploy
           if (Test-Path ./output) { Remove-Item -Recurse -Force ./output }
-          if (Test-Path ./functionapp.zip) { Remove-Item -Force ./functionapp.zip }
+          $stableZipPath = Join-Path -Path $env:GITHUB_WORKSPACE -ChildPath 'functionapp.zip'
+          if (Test-Path $stableZipPath) { Remove-Item -Force $stableZipPath }
 
           dotnet publish $proj.FullName --configuration Release --output ./output
 
@@ -74,11 +75,20 @@ jobs:
             exit 1
           }
 
-          Compress-Archive -Path ./output/* -DestinationPath ./functionapp.zip
-          $zipPath = (Resolve-Path ./functionapp.zip).Path
-          $stableZipPath = Join-Path -Path $env:GITHUB_WORKSPACE -ChildPath 'functionapp.zip'
-          if (Test-Path $stableZipPath) { Remove-Item -Force $stableZipPath }
-          Copy-Item -Path $zipPath -Destination $stableZipPath
+          $publishFiles = Get-ChildItem -Path ./output -Recurse -File -ErrorAction SilentlyContinue
+          if (-not $publishFiles) {
+            Write-Error "Publish output folder is empty; cannot create deployment zip."
+            exit 1
+          }
+
+          $archiveSource = Join-Path -Path (Resolve-Path ./output).Path -ChildPath '*'
+          Compress-Archive -Path $archiveSource -DestinationPath $stableZipPath -Force
+
+          if (-not (Test-Path $stableZipPath)) {
+            Write-Error "Deployment zip was not created at $stableZipPath."
+            exit 1
+          }
+
           Write-Host "Created deployment package: $stableZipPath"
           popd
       
