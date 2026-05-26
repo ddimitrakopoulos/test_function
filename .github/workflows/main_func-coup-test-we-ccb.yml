@@ -1,0 +1,93 @@
+# Deploy pre-built hello-func-deploy.zip to func-coup-test-we-ccb
+
+name: Deploy to func-coup-test-we-ccb
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'hello-func-deploy.zip'
+      - '.github/workflows/main_func-coup-test-we-ccb.yml'
+  workflow_dispatch:
+
+env:
+  FUNCTIONAPP_NAME: 'func-coup-test-we-ccb'
+  RESOURCE_GROUP:   'rg-coup-test-we-01'
+  STORAGE_ACCOUNT:  'stcoupfunctestwe01'
+  PACKAGE_PATH:     'hello-func-deploy.zip'
+
+jobs:
+  deploy:
+    runs-on: windows-latest
+    permissions:
+      id-token: write   # required for OIDC login
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify deployment package exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path $env:PACKAGE_PATH)) {
+            Write-Error "Deployment package not found: $env:PACKAGE_PATH"
+            exit 1
+          }
+          $size = [int]((Get-Item $env:PACKAGE_PATH).Length / 1KB)
+          Write-Host "Package ready: $env:PACKAGE_PATH ($size KB)"
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZUREAPPSERVICE_CLIENTID_TEST }}
+          tenant-id:       ${{ secrets.AZUREAPPSERVICE_TENANTID_TEST }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_TEST }}
+
+      - name: Configure Function App settings
+        shell: pwsh
+        run: |
+          $storageConn = az storage account show-connection-string `
+            --name $env:STORAGE_ACCOUNT `
+            --resource-group $env:RESOURCE_GROUP `
+            -o tsv
+          if (-not $storageConn) {
+            Write-Error "Could not retrieve storage connection string for $env:STORAGE_ACCOUNT"
+            exit 1
+          }
+          az functionapp config appsettings set `
+            --name $env:FUNCTIONAPP_NAME `
+            --resource-group $env:RESOURCE_GROUP `
+            --settings `
+              "AzureWebJobsStorage=$storageConn" `
+              "WEBSITE_CONTENTAZUREFILECONNECTIONSTRING=$storageConn" `
+              "FUNCTIONS_WORKER_RUNTIME=dotnet-isolated" `
+              "FUNCTIONS_EXTENSION_VERSION=~4" `
+              "WEBSITE_RUN_FROM_PACKAGE=0" `
+              "SCM_DO_BUILD_DURING_DEPLOYMENT=false" `
+              "ENABLE_ORYX_BUILD=false" | Out-Null
+          Write-Host "App settings updated."
+
+      - name: Deploy zip to Function App
+        uses: Azure/functions-action@v1
+        id:   fa_deploy
+        with:
+          app-name:  ${{ env.FUNCTIONAPP_NAME }}
+          slot-name: 'Production'
+          package:   ${{ env.PACKAGE_PATH }}
+
+      - name: Verify deployed functions
+        shell: pwsh
+        run: |
+          Start-Sleep -Seconds 10
+          $fns = az functionapp function list `
+            --name $env:FUNCTIONAPP_NAME `
+            --resource-group $env:RESOURCE_GROUP `
+            -o json | ConvertFrom-Json
+          if ($fns) {
+            Write-Host "Deployed functions:"
+            $fns | ForEach-Object { Write-Host "  - $($_.name)  $($_.invokeUrlTemplate)" }
+          } else {
+            Write-Host "No functions listed yet (app may still be warming up)."
+          }

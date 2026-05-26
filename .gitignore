@@ -1,12 +1,12 @@
-# Build output and deployment artifacts
+# Build output and temp artifacts
 hello-func-output/
-hello-func-deploy.zip
 function-source.zip
-function-test.zip
 extracted/
 output/
 publish/
-*.zip
+
+# Allow the deployment zip
+!hello-func-deploy.zip
 
 # .NET
 bin/
