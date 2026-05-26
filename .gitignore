@@ -1,0 +1,13 @@
+# Build output and deployment artifacts
+hello-func-output/
+hello-func-deploy.zip
+function-source.zip
+function-test.zip
+extracted/
+output/
+publish/
+*.zip
+
+# .NET
+bin/
+obj/
